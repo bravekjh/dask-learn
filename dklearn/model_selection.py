@@ -3,6 +3,7 @@ from __future__ import absolute_import, print_function, division
 from numbers import Number
 
 import dask
+from dask.delayed import Delayed
 from dask.threaded import get as threaded_get
 from dask.utils import derived_from
 
@@ -110,23 +111,7 @@ class DaskBaseSearchCV(BaseEstimator, MetaEstimatorMixin):
                              % self.best_estimator_)
         return self.scorer_(self.best_estimator_, X, y)
 
-    def fit(self, X, y=None, groups=None, **fit_params):
-        """Run fit with all sets of parameters.
-
-        Parameters
-        ----------
-        X : array-like, shape = [n_samples, n_features]
-            Training vector, where n_samples is the number of samples and
-            n_features is the number of features.
-        y : array-like, shape = [n_samples] or [n_samples, n_output], optional
-            Target relative to X for classification or regression;
-            None for unsupervised learning.
-        groups : array-like, shape = [n_samples], optional
-            Group labels for the samples used while splitting the dataset into
-            train/test set.
-        **fit_params
-            Parameters passed to the ``fit`` method of the estimator
-        """
+    def async_fit(self, X, y=None, groups=None, **fit_params):
         estimator = self.estimator
         self.scorer_ = check_scoring(estimator, scoring=self.scoring)
         error_score = self.error_score
@@ -145,14 +130,46 @@ class DaskBaseSearchCV(BaseEstimator, MetaEstimatorMixin):
         self.dask_graph_ = dsk
         self.n_splits_ = n_splits
 
-        get = self.get or dask.context._globals.get('get') or threaded_get
-        out = get(dsk, keys)
+        cv_results_ = Delayed(keys[0], dsk)
+        if len(keys) > 1:
+            best_estimator_ = Delayed(keys[1], dsk)
+            cv_results_, best_estimator_ = dask.persist(cv_results_, best_estimator_)
+        else:
+            (cv_results_,) = dask.persist(cv_results_)
+            best_estimator_ = None
 
-        self.cv_results_ = results = out[0]
-        self.best_index_ = np.flatnonzero(results["rank_test_score"] == 1)[0]
+        self.cv_results_ = cv_results_
+        self.best_index_ = dask.delayed(np.flatnonzero)(cv_results_["rank_test_score"] == 1)[0]
 
         if self.refit:
-            self.best_estimator_ = out[1]
+            self.best_estimator_ = best_estimator_
+        return self
+
+    def wait_fit(self):
+        if self.refit:
+            self.cv_results_, self.best_index_, self.best_estimator_ = dask.compute(self.cv_results_, self.best_index_, self.best_estimator_)
+        else:
+            self.cv_results_, self.best_index_ = dask.compute(self.cv_results_, self.best_index_)
+
+    def fit(self, X, y=None, groups=None, **fit_params):
+        """Run fit with all sets of parameters.
+
+        Parameters
+        ----------
+        X : array-like, shape = [n_samples, n_features]
+            Training vector, where n_samples is the number of samples and
+            n_features is the number of features.
+        y : array-like, shape = [n_samples] or [n_samples, n_output], optional
+            Target relative to X for classification or regression;
+            None for unsupervised learning.
+        groups : array-like, shape = [n_samples], optional
+            Group labels for the samples used while splitting the dataset into
+            train/test set.
+        **fit_params
+            Parameters passed to the ``fit`` method of the estimator
+        """
+        self.async_fit(X, y=y, groups=groups, **fit_params)
+        self.wait_fit()
         return self
 
     def visualize(self, filename='mydask', format=None, **kwargs):
